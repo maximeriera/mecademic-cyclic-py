@@ -154,6 +154,7 @@ def _is_loopback(address: str) -> bool:
 
 def produce(
     stop: threading.Event,
+    sender: Optional[socket.socket],
     address: str,
     connection_id: int,
     assembly: bytes,
@@ -161,14 +162,25 @@ def produce(
 ) -> None:
     """Send the output assembly cyclically until asked to stop.
 
+    The frames should leave from the socket the robot produces to.  A stateful
+    host firewall (Windows Firewall, for instance) then sees the robot's
+    frames as replies to this outbound flow and lets them in, with no inbound
+    rule needed.  Sent from any other port, they look unsolicited and are
+    dropped.
+
     Args:
         stop: Event signalling that production must end.
+        sender: Socket to send from, normally the advertised capture's.  It is
+            left open.  ``None`` sends from a socket of its own, on an
+            ephemeral port.
         address: IPv4 address of the robot.
         connection_id: Originator-to-target connection identifier.
         assembly: Raw output assembly image, produced unchanged.
         interval_s: Delay between two frames.
     """
-    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    owned = sender is None
+    if sender is None:
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sequence = 0
     try:
         while not stop.is_set():
@@ -181,7 +193,8 @@ def produce(
     except OSError as error:
         print("  producing stopped: {}".format(error))
     finally:
-        sender.close()
+        if owned:
+            sender.close()
 
 
 def describe(capture: Capture, reply: ForwardOpenReply, io_map: IoMap) -> None:
@@ -542,6 +555,7 @@ def run(address: str, rpi_ms: int, seconds: float, multicast: bool, udp_port: in
             target=produce,
             args=(
                 stop,
+                advertised.socket,
                 address,
                 reply.ot_connection_id,
                 io_map.empty_output_assembly(),

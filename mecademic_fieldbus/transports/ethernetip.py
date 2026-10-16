@@ -199,6 +199,7 @@ class EtherNetIpTransport(FieldbusTransport):
                     "the device at {} refused the EtherNet/IP session".format(address)
                 )
             self._enip.startIO(udp_port=self._originator_udp_port)
+            self._produce_from_listener()
             self._open_io_connection()
             self._connection.produce()
         except FieldbusConnectionError:
@@ -224,8 +225,8 @@ class EtherNetIpTransport(FieldbusTransport):
             return
         connection = self._connection
         if connection is not None:
+            self._stop_producer()
             try:
-                connection.stopProduce()
                 connection.sendFwdCloseReq(
                     self._input_instance, self._output_instance, self._config_instance
                 )
@@ -347,8 +348,49 @@ class EtherNetIpTransport(FieldbusTransport):
                 "(extended status 0x{:04X})".format(self._address, status)
             )
 
+    def _produce_from_listener(self) -> None:
+        """Make the stack produce from the socket it receives on.
+
+        The stack sends its cyclic frames from a socket of its own, on an
+        ephemeral port, while the robot produces to the listening port.  A
+        stateful host firewall -- Windows Firewall, with inbound UDP blocked by
+        policy -- then sees the robot's frames as unsolicited and drops them,
+        although nothing is wrong on the wire.  Producing from the listening
+        socket makes them replies to an outbound flow, which such a firewall
+        lets through with no inbound rule.
+
+        TODO: remove this workaround if the upstream stack learns to produce
+        from its listening socket.
+        """
+        listener = getattr(self._enip, "udpsock", None)
+        if listener is None or not hasattr(self._connection, "prodsock"):
+            # Unknown internals: keep the stack's own producing socket.
+            return
+        own_socket = self._connection.prodsock
+        self._connection.prodsock = listener
+        if own_socket is not None and own_socket is not listener:
+            own_socket.close()
+
+    def _stop_producer(self) -> None:
+        """Stop the producing thread of the stack and wait for it to finish.
+
+        The thread produces from the listening socket, so it must be gone
+        before that socket is closed, or it would send on a closed descriptor.
+        """
+        connection = self._connection
+        if connection is None:
+            return
+        try:
+            connection.stopProduce()
+        except (AttributeError, OSError):
+            pass
+        thread = getattr(connection, "prod_thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+
     def _teardown(self) -> None:
         """Release the stack objects and forget the process images."""
+        self._stop_producer()
         self._stop_io()
         self._enip = None
         self._connection = None
