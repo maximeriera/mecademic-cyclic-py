@@ -1,1 +1,581 @@
-# mecademic-cyclic-py
+# mecademic-fieldbus
+
+A **standalone** Python library that drives a Mecademic Meca500 over a
+fieldbus, by acting as the EtherNet/IP **scanner (originator)** of the robot's
+cyclic IN/OUT assemblies.
+
+The robot must already be running in fieldbus mode. Switching it into that mode
+is **out of scope** for this library: do it with the robot web interface or your
+own tooling first.
+
+> **Status.** The layering, the mock robot and the test harness are complete and
+> working end to end. The assembly layout is the **real one**, generated from
+> the official EDS of firmware 11.3 (`Meca500_v11.3.3.12637-official.eds`,
+> EDS revision 2.6). What is still missing is listed under
+> [Open decisions](#open-decisions) — chiefly the motion command identifiers,
+> which no vendor file publishes.
+
+## Why it is built this way
+
+Two constraints shaped the design:
+
+1. **The assembly layout will change.** New firmware means new fields, new
+   versions. So no application code — and no transport code — may ever depend on
+   a raw offset.
+2. **This may be ported to another language.** So the library depends on no
+   vendor library, its core needs nothing beyond the standard library, and the
+   most valuable part (the bit/word mapping) lives in a **declarative JSON
+   specification** rather than in Python.
+
+```
+Application
+    │  familiar API: ActivateRobot, Home, GetStatusRobot, ...
+    ▼
+FieldbusRobot ................ robot.py            layer 4: public facade
+    │  named, typed fields (RobotStatus, MotionCommand, ...)
+    ▼
+IoMap (versioned) ............ io_map/            layer 3: bits ↔ logical fields
+    │  raw assembly bytes
+    ▼
+FieldbusTransport ............ transports/        layer 2: protocol
+    │  wraps a third-party EtherNet/IP stack
+    ▼
+Fieldbus network
+```
+
+**The central rule of this repository:** *a bit or word offset never appears
+outside `mecademic_fieldbus/io_map/`.* Offsets live in
+`io_map/spec/assembly_v1.json`, are applied by `io_map/codec.py`, and are exposed
+to the rest of the world only as named fields. `IoMap.describe_layout()` is the
+one sanctioned way to show offsets to a human.
+
+Each layer is replaceable on its own:
+
+* **Another protocol?** One transport equals one file implementing
+  `FieldbusTransport`. Profinet would be `transports/profinet.py` and nothing
+  else would change — the firmware ships a GSDML describing the very same
+  assemblies. (EtherCAT is the known exception: it needs a real-time master and
+  will not fit this interface as-is, even though an ESI file exists.)
+* **Another EtherNet/IP stack?** Every call to the third-party stack is confined
+  to `transports/ethernetip.py`.
+* **New firmware layout?** Re-run the generator, add an `IoMap` subclass if the
+  field vocabulary changed; the facade is untouched.
+
+## Install
+
+From a prebuilt wheel (no checkout needed):
+
+```bash
+pip install 'mecademic_fieldbus-0.1.0-py3-none-any.whl[ethernetip]'
+```
+
+Drop `[ethernetip]` to install only the dependency-free core (I/O map, facade,
+mock robot). The wheel also puts a `mecademic-mock-robot` command on the PATH.
+
+To build the wheel yourself:
+
+```bash
+pip install build
+python -m build        # writes dist/*.whl and dist/*.tar.gz
+```
+
+For development, from a checkout:
+
+```bash
+pip install -e '.[dev]'
+```
+
+The core has **no dependencies**. The EtherNet/IP transport needs
+[`python-ethernetip`](https://codeberg.org/paperwork/python-ethernetip)
+(published on PyPI as `ethernetip`), pulled in by the `ethernetip` extra. That
+stack was chosen because, unlike most Python EtherNet/IP libraries, it supports
+Class 1 implicit I/O towards a *generic* adapter — `registerAssembly` plus
+`sendFwdOpenReq` plus a `produce` cycle — and not only Rockwell tag messaging.
+
+## Quick start against the simulated robot
+
+No hardware needed. In one terminal:
+
+```bash
+python -m mock_robot
+```
+
+In another:
+
+```bash
+python examples/minimal_session.py --mock
+```
+
+The mock is a real EtherNet/IP adapter on TCP 44818 and UDP 2222: it answers
+Register Session and Forward Open, validates the requested connection points and
+sizes against the specification, then consumes the cyclic output assembly and
+produces the cyclic input assembly, driven by a state machine
+(`deactivated → activating → activated → homing → idle → moving`, plus `error`).
+
+`--mock` exists because the motion command identifiers are the one thing no
+vendor file publishes; see [Open decisions](#open-decisions).
+
+## Quick start against a real robot
+
+```bash
+python examples/minimal_session.py --address 192.168.0.100
+```
+
+In code, the three layers are wired explicitly. The transport is built *from*
+the I/O map, so the assembly instances, sizes and connection parameters are
+declared in exactly one place:
+
+```python
+from mecademic_fieldbus import FieldbusRobot, get_io_map
+from mecademic_fieldbus.transports.ethernetip import EtherNetIpTransport
+
+io_map = get_io_map()
+transport = EtherNetIpTransport.from_io_map(io_map)
+
+robot = FieldbusRobot(transport, io_map)
+robot.Connect("192.168.0.100")
+robot.ActivateRobot()
+robot.Home()
+print(robot.GetStatusRobot())
+print(robot.GetRobotPosition().joints)
+robot.MoveJoints(0, 0, 0, 0, 30, 0)
+robot.WaitIdle()
+robot.DeactivateRobot()
+robot.Disconnect()
+```
+
+### What the protocol imposes
+
+There is no request/response here, and the vendor semantics are specific:
+
+* The output assembly is a **process image** the transport keeps producing, so a
+  command is *latched*, not sent. Every `RobotControl` bit is **level**
+  triggered — it acts "as soon as, and as long as" it is set — and `Deactivate`
+  takes precedence over `Activate`.
+* `MotionControl_ResumeMotion` is the exception: it acts on its **rising edge**
+  only. `ResumeMotion()` pulses it for you.
+* A motion command is picked up only when **`MotionControl_MoveId` changes**,
+  while `MotionControl_Setpoint` is set. There is no acknowledgement beyond the
+  robot echoing the id back in `MotionStatus_MoveID`. `Connect()` therefore
+  resumes the numbering where the robot left it, so a scanner restarting against
+  a live robot never reuses an id the robot would silently discard.
+* There is **no error bit**: a non-zero `RobotStatus_Error` is what signals the
+  error state. `RobotStatus.error_status` derives it for you.
+* Motion commands come in **two flavours**, and mixing them up is a documented
+  footgun. Positional and configuration commands are *queued* by changing the
+  move id (`SendMotionCommand`). The three velocity-mode commands —
+  `MoveJointsVel`, `MoveLinVelWrf`, `MoveLinVelTrf` — are *held* with a move id
+  of `0` and run continuously (`StartVelocityCommand` / `StopVelocityCommand`).
+  Queueing a velocity command, or holding a positional one, fills the motion
+  queue with a copy of it every cycle. The facade refuses both, naming the
+  method you meant.
+* Every motion control action is confirmed by a status bit, never by a delay —
+  the manual is explicit about it — so `PauseMotion`, `ResumeMotion` and
+  `ClearMotion` wait for their confirmation before returning.
+
+### Reading what the fixed fields do not carry
+
+The 252 input bytes hold the target position, not the measured one, and nothing
+about torques, limits or the gripper. Those come through the four **dynamic data
+slots**: write a type identifier into `DynamicTypeCfg0..3`, and the robot echoes
+it back in `DynamicType0..3` with up to six values alongside it.
+
+```python
+robot.SetDynamicDataTypes("ActualJointPosition", "FirmwareVersion")
+print(robot.GetDynamicData(0).values)      # measured joint angles
+print(robot.GetDynamicData(1).values)      # 11.0, 3.0, 3.0, 12637.0, ...
+```
+
+Always check the echoed type before trusting the values: a change takes a cycle
+or two to take effect, and type `0` means *automatic*, where the robot cycles
+through every type it can report, one per cycle. `GetDynamicData` returns a
+`DynamicData` carrying both, so the check is `data.type_id`.
+
+The same slots read **robot variables**. Identifiers 10000–19999 address a
+variable rather than a command, in both directions: write one through
+`SendMotionCommand`, read it back through a slot.
+
+```python
+robot.SendMotionCommand(10001, 1.5, 2.5, 3.5)   # write variable 10001
+robot.SetDynamicDataTypes(10001)
+print(robot.GetDynamicData(0).values[:3])       # (1.5, 2.5, 3.5)
+```
+
+## Repository layout
+
+```
+mecademic_fieldbus/
+    robot.py                  FieldbusRobot, the public facade
+    robot_classes.py          RobotStatus, MotionCommand, ... (self-contained)
+    exceptions.py             FieldbusError and its subclasses
+    transports/
+        base.py               FieldbusTransport (ABC)
+        ethernetip.py         the only file that touches a third-party stack
+    io_map/
+        base.py               IoMap (ABC), versioned
+        v1.py                 IoMapV1, a typed accessor over the spec
+        codec.py              the only code that manipulates offsets
+        spec_loader.py        loads and validates the spec
+        spec/assembly_v1.json THE SOURCE OF TRUTH, generated from the EDS
+mock_robot/
+    simulator.py              robot state machine, shares the same io_map
+    server.py                 minimal EtherNet/IP adapter, raw sockets
+    loopback.py               the simulator wired straight to the facade
+tools/
+    eds_to_spec.py            regenerates the spec from a vendor EDS
+    motion_commands_v1.json   command ids, transcribed from the manual
+    field_docs_v1.json        per-field documentation, from the vendor GSDML
+    dynamic_data_types_v1.json dynamic data type ids, from the manual
+    update_companion_tables.py merges all three into the spec, no EDS needed
+    make_fixtures.py          regenerates the golden test vectors
+    eip_originator.py         dependency-free CIP originator, for diagnosis
+    diagnose_connection.py    finds out why a robot produces nothing
+examples/minimal_session.py   works against the mock and against a real robot
+tests/
+    fake_transport.py         in-memory transports for the unit tests
+    fixtures/                 golden assembly images, one per scenario
+```
+
+## The assembly specification
+
+`io_map/spec/assembly_v1.json` is **generated, not written**:
+
+```bash
+python tools/eds_to_spec.py path/to/Meca500_vX.eds \
+    -o mecademic_fieldbus/io_map/spec/assembly_v1.json
+python tools/make_fixtures.py          # then refresh the golden vectors
+```
+
+The generator reads the `[Device]`, `[Params]`, `[Assembly]` and
+`[Connection Manager]` sections, expands each CIP bit string into one boolean
+field per named bit, drops the reserved and unused ones, and computes every
+offset from the ordered member list. It fails loudly if the member sizes
+contradict the connection sizes the EDS declares.
+
+Three things it cannot generate, because **no vendor definition file publishes
+them** — not the EDS, not the GSDML, not the ESI. Each lives in a
+hand-maintained companion table next to the generator, carrying its own
+provenance, and is merged into the same specification file:
+
+| table | what it holds | source |
+| --- | --- | --- |
+| `tools/motion_commands_v1.json` | the 48 motion command identifiers | Table 8 of the programming manual |
+| `tools/dynamic_data_types_v1.json` | the 40 dynamic data type identifiers | Table 12 of the programming manual |
+| `tools/field_docs_v1.json` | a description for each of the 39 boolean fields | the vendor GSDML |
+
+The last one exists because the EDS keeps the help text of its CIP bit strings
+in comments the parser strips, so every boolean field would otherwise come out
+undocumented. When only these tables change, no EDS is needed:
+
+```bash
+python tools/update_companion_tables.py
+```
+
+It warns when a companion entry matches no field (a typo, or a renamed field)
+and when a field is left with no description, and `test_every_field_is_documented`
+keeps it that way. Documentation only ever touches `description` and `unit`, so
+it can never move an offset — the golden byte vectors are the proof.
+
+What it produces for firmware 11.3:
+
+| | value |
+| --- | --- |
+| Input assembly (robot → scanner) | instance **100**, **252** bytes, 91 fields |
+| Output assembly (scanner → robot) | instance **150**, **60** bytes, 26 fields |
+| Connection path | `20 04 2C 96 2C 64` — **no configuration assembly** |
+| Real-time format | O→T 32-bit run/idle header, T→O modeless |
+| RPI | min **10 ms**, max 10 s, default 10 ms |
+| Electronic key | vendor 1565, product type 43, product code 500, rev 11.3 |
+
+Tools that render their own view of the layout — a dashboard, a report — get it
+as **data** rather than parsing the text:
+
+```python
+io_map = get_io_map()
+described = io_map.describe_assembly("input")      # AssemblyDescription
+described.size_bytes, described.run_idle_header    # 252, False
+for field in described.fields:                     # FieldSpec: offsets, type, unit, description
+    ...
+io_map.decode_all("input", raw)                    # every field at once, by name
+```
+
+`describe_layout()` is rendered from exactly that, so the text view and the
+structured view cannot drift apart. A caller that *consumes* offsets from here
+still honours the central rule; one that hard-codes them does not.
+
+Inspect the whole layout with:
+
+```bash
+python -m mock_robot --show-layout
+```
+
+Field names are the vendor spelling (`RobotStatus_Activated`,
+`MotionCommand_Arg1`, …) so any value can be traced straight back to the EDS,
+the GSDML and the programming manual. JSON was chosen over YAML deliberately: it
+needs no dependency, and every language a port might target parses it out of the
+box. A port only has to reimplement the ~200 lines of `codec.py`; the layout
+itself travels unchanged.
+
+**Layout mismatch detection.** The assembly carries no revision field, so there
+is nothing to compare — but nothing is needed: the robot validates the
+negotiated connection sizes at Forward Open time, so a scanner built on the
+wrong layout version cannot open a connection at all. `tests/` covers that.
+
+## Testing
+
+```bash
+pytest                       # everything
+pytest -m "not integration"  # unit tests only, no sockets
+pytest -m integration        # the real stack against the mock robot
+```
+
+Four levels:
+
+* **Unit** — `FakeTransport` feeds byte fixtures in memory; `SimulatorTransport`
+  wires the facade straight to the simulator with no network at all.
+* **Golden vectors** — `tests/fixtures/assembly_v1_vectors.json` pins the exact
+  bytes each scenario must produce, so an accidental change to the spec is caught
+  immediately. These vectors are also the conformance reference a port to another
+  language should reproduce byte for byte.
+* **Integration** — the real `EtherNetIpTransport` opens a Class 1 connection to
+  the mock robot over real sockets, with the real connection path and sizes.
+  Needs TCP 44818 and UDP 2222 free; skipped otherwise.
+* **Hardware** — the acceptance suite, against a real robot. Skipped unless you
+  give it an address; see below.
+
+### Against a real robot
+
+`tests/test_hardware.py` is the only suite that touches hardware, and it has two
+tiers with separate opt-ins:
+
+```bash
+# Tier 1 — reads, activates, deactivates. Does not move the robot.
+pytest tests/test_hardware.py --robot-address 192.168.0.100
+```
+
+```bash
+# Tier 2 — adds homing and motion. Read the preconditions in the file first.
+pytest tests/test_hardware.py --robot-address 192.168.0.100 --allow-motion
+```
+
+Tier 2 homes the robot and moves **one joint** by a small amount — by default
+the last one, whose rotation displaces the tool least — returning it to where it
+started. Nothing moves in Cartesian space, and nothing moves further than
+`--motion-amplitude` (default 5°) from the position the suite measured.
+`--motion-joint` picks a different one. Teardown always releases any held
+velocity command, clears the queue, resets a pending error and deactivates.
+
+What it is really for: proving that the specification generated from *your*
+firmware's EDS matches the robot in front of you. A wrong offset surfaces as an
+implausible decoded value — a queue capacity outside 1..13000, a joint angle
+past 400°, a resettable stop that is not asserted — rather than as a robot doing
+something unexpected. `test_checkpoint_round_trips_through_the_assemblies` is
+the centrepiece: `SetCheckpoint` travels the whole output path and comes back
+through the input assembly, proving the command handshake end to end **without
+moving an axis**.
+
+### Command coverage
+
+`tests/test_hardware_commands.py` exercises the 48 command identifiers. They are
+not equally safe to send — one changes joint limits, one reboots the robot,
+several drive a gripper that may be holding something — so every identifier is
+triaged in `tests/command_groups.py`, with the reason, and the risky groups need
+their own opt-in:
+
+| Group | Enabled by | Contents |
+| --- | --- | --- |
+| harmless | *(default)* | `SetCheckpoint`, `Delay` — no lasting effect |
+| configuration | `--allow-config` | velocities, accelerations, blending, auto-conf; restored to documented defaults afterwards |
+| joint motion | `--allow-motion` | `MoveJoints`, `MoveJointsRel`, `MoveJointsVel` |
+| Cartesian motion | `--allow-cartesian` | `MovePose`, `MoveLin`, the relative and velocity variants |
+| tool | `--allow-tool` | gripper and valve commands |
+| needs deliberate setup | *never* | frames, payload, torque limits, tool sphere, collision config — values a human must choose for the cell |
+| never sent | *never* | `RebootRobot`, `ClearRobotHoming`, `StartProgram`, joint limits, work zone, calibration |
+
+`test_command_groups.py` runs in the ordinary suite, without a robot, and fails
+if any declared identifier is untriaged, claimed by two groups, or invented. So
+when a firmware update adds a command, the suite tells you rather than silently
+ignoring it.
+
+**What "tested" means.** The robot *accepts* the command and acknowledges its
+move id — which catches a wrong identifier, a wrong argument count, and a
+command the firmware rejects. It does not confirm the *effect* of a setting,
+because the input assembly carries no settings back. Reading them back is what
+the dynamic data slots are for — `SetDynamicDataTypes` / `GetDynamicData` now
+expose them, though the per-command assertions have yet to be written against
+that route. Where an effect *is* observable
+with what the assembly carries, there is a dedicated test for it:
+`SetCheckpoint` comes back as `CheckpointReached`, `Delay` holds the queue
+without moving an axis, the move commands are checked against the reported
+position, and `SetJointVel` is verified by timing the same move at two
+velocities.
+
+Rehearse it against the simulator before pointing it at hardware — the mock
+answers the same protocol, so the suite's own logic gets validated for free:
+
+```bash
+python -m mock_robot
+```
+
+```bash
+pytest tests/test_hardware.py tests/test_hardware_commands.py \
+    --robot-address 127.0.0.1 --robot-udp-port 0 \
+    --allow-motion --allow-config --allow-cartesian --allow-tool
+```
+
+## Troubleshooting
+
+### The robot reacts to commands but the scanner sees nothing back
+
+The output direction works, the input one does not: the robot logs the commands,
+while `GetStatusRobot()` keeps returning an all-zero image and `ActivateRobot()`
+times out waiting for a bit the robot has already set.
+
+Run:
+
+```bash
+python tools/diagnose_connection.py --address 192.168.0.100
+```
+
+It opens the connection normally, then listens on **two** ports at once with its
+own sockets and no filtering: the standard UDP 2222, and an ephemeral one which
+is what it advertises in the T→O socket address item of the Forward Open. Which
+one receives data settles it:
+
+| Result | Cause | Fix |
+| --- | --- | --- |
+| Data on **2222** | The robot ignores the socket address item and produces to the standard port. | Listen on 2222 — the default since `EtherNetIpTransport(..., originator_udp_port=2222)`. An ephemeral port never sees this robot. |
+| Data on the **ephemeral** port | The robot honours the item; the receive path works. | Check what the report flags: usually the source address or the connection id the stack filters on. |
+| **Nothing** on either | The robot is not producing to this host. | See [Nothing arrives at all](#nothing-arrives-at-all) below. |
+
+The tool opens the connection itself, with raw sockets and no third-party stack,
+which buys two things the stack cannot give:
+
+* the **socket address items of the Forward Open reply**, where the target says
+  where it will send — including the group address when the connection is
+  multicast. The stack parses those items and discards them
+  (`ethernetip.py:1801`), which is exactly why a multicast robot looks silent
+  rather than misconfigured;
+* unfiltered listening. Two filters inside the stack drop frames without a word,
+  and the tool reports both: it only accepts datagrams whose **source IP equals
+  the address you connected to** (so connect by IP, not by hostname, and use the
+  address the robot answers *from*), and whose **connection id matches** the one
+  returned by the Forward Open.
+
+### Reading the reply's socket address
+
+The `reply socket address` lines are the most informative part of the output:
+
+| Item | Meaning |
+| --- | --- |
+| `O->T <robot ip>:2222` (0x8000) | Where the robot *receives* what you produce. |
+| `T->O 0.0.0.0:<port>` (0x8001) | The robot **echoed** the endpoint you asked for. `0.0.0.0` is the CIP convention for "the address you connected from", so it will send to your host on that port. Echoing it means it accepted the item, and that the connection is point to point. |
+| `T->O 239.x.x.x:<port>` (0x8001) | The robot produces **multicast** to that group. A scanner that does not join it never sees a frame. |
+| *(no 0x8001 item)* | The robot said nothing about where it will send; it may well ignore the item and use the standard 2222. |
+
+An echoed `0.0.0.0:<port>` plus nothing captured is a *narrow* result: the robot
+agreed to send to that exact port, so it is neither ignoring the request nor
+using multicast, and something between the two sockets is dropping the data.
+
+> **The ephemeral-port trap.** If the echoed port is not 2222, a firewall rule
+> written for UDP 2222 does not cover it. Re-run with `--udp-port 2222` — which
+> is the default, and what `EtherNetIpTransport` uses — or allow the *program*
+> rather than a port.
+
+### Nothing arrives at all
+
+If the tool captures nothing on any port, the robot is not producing to this
+host. Work through these in order — the first step tells you which half of the
+problem you have.
+
+**1. Is anything reaching the machine?** `tcpdump` sees packets before any
+firewall drops them at the socket layer:
+
+```bash
+sudo tcpdump -n -i any 'udp and (port 2222 or ip multicast)'
+```
+
+Leave it running and start the diagnostic in another terminal.
+
+**2. Packets in `tcpdump` but nothing captured → a host firewall.** On macOS:
+
+```bash
+/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
+/usr/libexec/ApplicationFirewall/socketfilterfw --getblockall
+```
+
+If block-all is on, turn it off, or allow the interpreter:
+
+```bash
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add $(python -c 'import sys; print(sys.executable)')
+```
+
+Check `pf` too if your organisation enables it (`sudo pfctl -s info`). On Linux,
+`sudo iptables -L -n | grep 2222` or `sudo firewall-cmd --list-all`.
+
+**3. Nothing in `tcpdump` either → the robot is not sending.** In order:
+
+* retry with `--multicast`: some targets only produce to a group when the
+  connection asks for one. If that works, the report names the group;
+* check the robot is really in EtherNet/IP mode, and that **no other scanner
+  already owns** the exclusive-owner connection — a second originator gets a
+  connection that produces nothing, or a monitoring-only one. The facade raises
+  on `RobotStatus_MonitoringMode` for that reason;
+* check the return route. The Forward Open travelled over TCP, so IP works in
+  both directions, but a robot on another subnet with no gateway configured can
+  answer TCP and still fail to send unsolicited UDP. Confirm both ends sit on
+  the same subnet, or that the robot has a gateway.
+
+### Running a scanner and the simulated robot on one machine
+
+They cannot both hold UDP 2222. Give the scanner an ephemeral port and let the
+Forward Open advertise it — which is what `examples/minimal_session.py --mock`
+and the integration tests do:
+
+```python
+EtherNetIpTransport.from_io_map(io_map, originator_udp_port=0)
+```
+
+This only works because the mock honours the socket address item. Never use it
+against hardware that has not been checked with the tool above.
+
+## Training and demo tools
+
+The live tag dashboard and the narrated command walkthrough live in a sibling
+repository, [`mecademic-fieldbus-training`](../mecademic-fieldbus-training),
+which consumes this library rather than extending it. That keeps this repo to
+the library, its simulator and its own tooling — and makes the toolkit a working
+proof that the public API is usable from outside.
+
+What stays here is what a consumer cannot add from outside: the structured
+introspection API above, the per-field documentation, and
+`mock_robot.LoopbackTransport`.
+
+## Open decisions
+
+Everything below is marked `# TODO` in the code:
+
+| Topic | What is needed |
+| --- | --- |
+| **Error codes** | `RobotStatus_Error` is documented as "refer to the programming manual"; the table is not in any protocol file. The simulator invents codes in the 32000s to stay inside the field. |
+| **Digital I/O** | The cyclic assemblies carry none — the manual confirms it, listing `SetOutputState` (34) as *not available on this robot*. `SetOutputState`/`GetRtOutputState` raise `FieldbusUnsupportedFeature`. |
+| **Monitoring-only connection** | Only the exclusive-owner connection is implemented, so a scanner cannot watch a cell while someone else's PLC drives it — the robot refuses a second owner. The robot's EDS declares an input-only connection (path `20 02 2C 64`, O→T heartbeat) and the library already decodes `RobotStatus_MonitoringMode` and honours it in `_require_control()`; the gap is a read-only transport. `ethernetip` 1.2.0 cannot do it, but `tools/eip_originator.py` already takes an arbitrary connection path. |
+| **Command read-back** | The command suite confirms settings by acknowledgement; verifying their *effect* now has a route through the dynamic data slots, but the per-command assertions have not been written against it. |
+| **Variable writes and homing** | A write to a robot variable goes through `SendMotionCommand`, which refuses unless the robot is activated, homed and error free. At the protocol level the write lands on a robot that is merely activated — the training sequence does exactly that — so the facade is stricter than the wire here. Whether a real robot agrees is unverified, and loosening a safety gate on an assumption is the wrong direction, so it stays until it can be tested on hardware. |
+| **Command wrappers** | All 48 identifiers are reachable through `SendMotionCommand`, but only `MoveJoints` and `MovePose` have a named wrapper. |
+| **Socket address item** | Whether the robot honours the T→O socket address item is still unconfirmed on hardware; the scanner listens on 2222 by default so that it does not matter. See [Troubleshooting](#troubleshooting). |
+| **Connection watchdog** | The mock does not drop the connection when the scanner stops producing, and never sets `StopMask_ConnectionDropped`. |
+| **Joint limits** | The simulator applies a flat ±175°; the real per-joint limits are in the manual. |
+| **`mock_robot` package name** | Too generic a top-level name to publish as-is. |
+
+## Conventions
+
+* Python 3.8+, type hints and full docstrings throughout.
+* `black` and `isort` (line length 100), `flake8` via `setup.cfg`.
+* The facade uses `PascalCase` method names on purpose, to match the vocabulary
+  of the robot TCP/IP API. Everything else follows PEP 8.
+* No dependency on any vendor library, ever.
+
+## License
+
+MIT.
